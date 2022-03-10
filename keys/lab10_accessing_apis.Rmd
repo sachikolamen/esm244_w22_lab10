@@ -17,6 +17,14 @@ library(here)
 
 ```
 
+## API used in Shiny App
+
+https://tylerclavelle.shinyapps.io/thePhactory/
+
+see https://docs.phish.net/examples for API documentation.
+
+Also, check out https://shiny.rstudio.com/articles/shinyapps.html to deploy your Shiny app online for other users.  Free account is limited to 25 hours of user time per month, and better than nothing!
+
 ## Accessing IUCN API
 
 - first: add API key to .Renviron and why do it this way?
