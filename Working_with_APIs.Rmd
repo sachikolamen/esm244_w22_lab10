@@ -1,0 +1,176 @@
+---
+title: "IUCN Redlist"
+author: "Sachiko Lamen"
+date: "3/10/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(sf)
+library(raster)
+library(rnaturalearth)
+library(tidyverse)
+library(here)
+library(jsonlite) # to access API
+```
+
+### Accessing IUCN API
+```{r}
+api_key <-Sys.getenv('IUCN_KEY')
+```
+
+
+```{r}
+### append the endpoint to the domain name: 
+domain_name <- 'http://apiv3.iucnredlist.org'
+version_end <- 'api/v3/version'
+
+version_url <- file.path(domain_name, version_end)
+api_version <- jsonlite::fromJSON(version_url)
+api_version$version
+```
+### Get a count of how many species have been assessed
+
+spp count endpoint: `/api/v3/speciescount?token='YOUR TOKEN'`
+```{r}
+count_stem <- 'api/v3/speciescount?token=%s' 
+  ### a format string for sprintf - %s means replace this with character string var;
+  ### lots of numeric formats supported, 
+  ### e.g., sprintf('%f', pi) vs sprintf('%.3f', pi)
+count_end <- sprintf(count_stem, api_key)
+count_url <- file.path(domain_name, count_end)
+
+spp_count <- jsonlite::fromJSON(count_url)
+spp_count$count
+```
+
+### Get a page of results
+
+page endpoint: `/api/v3/species/page/:page_number?token='YOUR TOKEN'`
+```{r}
+page_stem <- 'api/v3/species/page/%s?token=%s'
+page_end <- sprintf(page_stem, 1, api_key) ### multiple variables into format string
+page_url <- file.path(domain_name, page_end)
+
+spp_page1 <- fromJSON(page_url)
+
+### convert extinction risk into factor and plot counts
+spp_df <- spp_page1$result %>%
+  mutate(category = factor(category, levels = c('LC', 'NT', 'VU', 'EN', 'CR', 'EX'))) %>%
+  filter(!is.na(category))
+
+ggplot(spp_df) +
+  geom_bar(aes(x = category, fill = category)) +
+  scale_fill_brewer(palette = 'RdYlGn', direction = -1)
+```
+
+### Get current and historic assessment info for a species
+
+historic assessments endpoint: `/api/v3/species/history/name/:name?token='YOUR TOKEN'`
+
+```{r}
+hist_stem <- 'api/v3/species/history/name/%s?token=%s'
+spp <- 'Dermochelys coriacea'
+hist_end <- sprintf(hist_stem, spp, api_key)
+hist_url <- file.path(domain_name, hist_end)
+
+spp_hist <- fromJSON(hist_url)
+
+spp_hist_df <- spp_hist$result
+```
+
+### Pull threats and narrative, and extract information on gear types
+
+Threats: `/api/v3/threats/species/name/:name?token='YOUR TOKEN'`
+Narratives: `/api/v3/species/narrative/:name?token='YOUR TOKEN'`
+```{r}
+threats_stem <- 'api/v3/threats/species/name/%s?token=%s'
+thr_url <- file.path(domain_name, sprintf(threats_stem, spp, api_key))
+spp_thr <- fromJSON(thr_url)$result
+
+narratives_stem <- 'api/v3/species/narrative/%s?token=%s'
+narr_url <- file.path(domain_name, sprintf(narratives_stem, spp, api_key))
+spp_narr <- fromJSON(narr_url)$result
+
+spp_narr$threats
+```
+
+## MAKE A MAP
+- Read in IUCN and AquaMaps data
+
+```{r}
+iucn_spp_info <- read_csv(here('data/iucn_marine_spp_info_2021-3.csv'))
+iucn_spp_info$cat %>% unique()
+
+cell_ids <- read_csv(here('data/am_latlong.csv'))
+spp_cells <- read_csv(here('data/am_spp_cells.csv'))
+spp_ids <- read_csv(here('data/am_spp_ids.csv'))
+
+
+spp_risk_cells <- spp_cells %>%
+  inner_join(cell_ids, by = 'loiczid') %>%
+  inner_join(spp_ids, by = 'am_sid') %>%
+  inner_join(iucn_spp_info, by = c('binomial' = 'sciname')) # link dataframes on column names that dont match but have the same contents :)
+
+threatened_pct_cells <- spp_risk_cells %>%
+  filter(prob >= 0.5) %>%
+  mutate(threatened = (tolower(cat) %in% c('vu', 'en', 'cr'))) %>% # is this lowercase categry in this vector -- returns column threatened with values of true or false
+  filter(cat != 'dd') %>%
+  group_by(lon, lat) %>%
+  summarize(pct_threatened = sum(threatened) / n())
+```
+
+### Convert cells into a raster object
+
+If we wished to do spatial analysis with this lat-long map of percent threatened species, we can convert our grid to a raster.  Don't forget to tell it our CRS, which since we are using lat-long data, we can use WGS84, EPSG code 4326.
+
+```{r}
+spp_risk_rast <- rasterFromXYZ(threatened_pct_cells)
+crs(spp_risk_rast) <- 4326
+
+plot(spp_risk_rast)
+```
+
+### Plot with ggplot
+
+`ggplot2::geom_raster` does not actually plot `raster` format objects, but gridded data in a dataframe with values that can be assigned to x and y.  If we had data with a native `raster` format, we could convert to a `data.frame` (the reverse of `rasterFromXYZ`) using `as.data.frame(r, xy = TRUE)` - but we already have that in the form of threatened_pct_cells, so let's see if they are different!  
+
+```{r}
+spp_risk_rast_df <- spp_risk_rast %>%
+  as.data.frame(xy = TRUE)
+### Why does this have different length than threatened_pct_cells?
+
+ggplot(threatened_pct_cells) +
+  geom_raster(aes(x = lon, y = lat, fill = pct_threatened)) +
+  scale_fill_viridis_c() +
+  coord_sf()
+```
+
+### Let's finalize our map by overlaying a continent shape
+
+We will use vector data from Natural Earth, using the `rnaturalearth` package.  To get higher resolution vector data of global countries, install the `rnaturalearthdata` and `rnaturalearthhires` packages too.
+
+Note, we can access individual countries, or continents, or states; but we probably also want to crop the resulting geometry down to just our area of focus.  Because we made a raster object from our grid of data, we can use that as our crop bounding box.
+
+```{r}
+land_sf <- rnaturalearth::ne_countries(scale = 50, ### start with 110
+                                       country = c('united states of america', 'mexico'),
+                                       returnclass = 'sf')
+# plot(land_sf %>% select(geometry))
+# st_crs(land_sf)
+
+land_sf_cropped <- land_sf %>%
+  st_crop(spp_risk_rast)
+
+ggplot() +
+  geom_raster(data = threatened_pct_cells, aes(x = lon, y = lat, fill = pct_threatened)) +
+  geom_sf(data = land_sf_cropped, fill = 'grey80', color = 'grey40', alpha = .5) +
+  scale_fill_viridis_c() +
+  coord_sf() +
+  theme_void()
+
+```
+
+
+
